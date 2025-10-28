@@ -4,8 +4,10 @@ use image::DynamicImage;
 use ocrs::{ImageSource, OcrEngine, OcrEngineParams};
 use rten::Model;
 use screenshots::Screen;
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::io::{self, Write};
+use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -25,12 +27,20 @@ const PRESET_WIDTH: u32 = 870;
 const PRESET_HEIGHT: u32 = 55;
 const PRESET_REFRESH_MS: u64 = 500;
 const PRESET_EMPTY_THRESHOLD: u32 = 2;
+const PRESET_WINDOW_DETECTION: bool = true;
+const TARGET_WINDOW_CLASS: &str = "PROClient.x86_64";
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct Config {
     region: Region,
     refresh_rate: Duration,
     empty_threshold: u32,
+    window_detection: bool,
+}
+
+#[derive(Deserialize)]
+struct HyprlandWindow {
+    class: String,
 }
 
 fn get_config_from_user() -> Result<Config> {
@@ -41,12 +51,13 @@ fn get_config_from_user() -> Result<Config> {
     let mut choice = String::new();
     io::stdin().read_line(&mut choice)?;
     
-    let (region, refresh_rate, empty_threshold) = if choice.trim().to_lowercase() == "y" {
+    let (region, refresh_rate, empty_threshold, window_detection) = if choice.trim().to_lowercase() == "y" {
         println!("\nUsing preset configuration:");
         println!("  X: {}, Y: {}", PRESET_X, PRESET_Y);
         println!("  Width: {}, Height: {}", PRESET_WIDTH, PRESET_HEIGHT);
         println!("  Refresh rate: {}ms", PRESET_REFRESH_MS);
         println!("  Empty threshold: {}", PRESET_EMPTY_THRESHOLD);
+        println!("  Window detection: {}", PRESET_WINDOW_DETECTION);
         
         (
             Region {
@@ -57,6 +68,7 @@ fn get_config_from_user() -> Result<Config> {
             },
             Duration::from_millis(PRESET_REFRESH_MS),
             PRESET_EMPTY_THRESHOLD,
+            PRESET_WINDOW_DETECTION,
         )
     } else {
         println!("\nEnter custom coordinates:");
@@ -97,14 +109,37 @@ fn get_config_from_user() -> Result<Config> {
         io::stdin().read_line(&mut threshold_input)?;
         let empty_threshold: u32 = threshold_input.trim().parse().context("Invalid threshold")?;
 
+        print!("Enable window detection? (y/n): ");
+        io::stdout().flush()?;
+        let mut window_input = String::new();
+        io::stdin().read_line(&mut window_input)?;
+        let window_detection = window_input.trim().to_lowercase() == "y";
+
         (
             Region { x, y, width, height },
             Duration::from_millis(refresh_ms),
             empty_threshold,
+            window_detection,
         )
     };
     
-    Ok(Config { region, refresh_rate, empty_threshold })
+    Ok(Config { region, refresh_rate, empty_threshold, window_detection })
+}
+
+fn check_active_window() -> Result<bool> {
+    let output = Command::new("hyprctl")
+        .args(&["activewindow", "-j"])
+        .output()
+        .context("Failed to run hyprctl")?;
+
+    if !output.status.success() {
+        return Ok(false);
+    }
+
+    let json_str = String::from_utf8(output.stdout)?;
+    let window: HyprlandWindow = serde_json::from_str(&json_str)?;
+    
+    Ok(window.class == TARGET_WINDOW_CLASS)
 }
 
 fn capture_region(screen: &Screen, region: &Region) -> Result<DynamicImage> {
@@ -140,6 +175,34 @@ fn extract_text(engine: &OcrEngine, image: &DynamicImage) -> Result<String> {
     Ok(text.trim().to_string())
 }
 
+/// Normalize Pokemon names by merging superstrings into substrings
+fn normalize_pokemon_names(text_counts: &HashMap<String, usize>) -> HashMap<String, usize> {
+    let mut normalized: HashMap<String, usize> = HashMap::new();
+    let mut keys: Vec<_> = text_counts.keys().collect();
+    keys.sort_by_key(|k| k.len()); // Process shorter strings first
+    
+    for key in keys {
+        let count = text_counts[key];
+        let mut merged = false;
+        
+        // Check if this key is a superstring of any existing normalized key
+        for (norm_key, norm_count) in normalized.iter_mut() {
+            if key.contains(norm_key.as_str()) && key != norm_key {
+                *norm_count += count;
+                merged = true;
+                println!("  Merged \"{}\" ({}) into \"{}\"", key, count, norm_key);
+                break;
+            }
+        }
+        
+        if !merged {
+            normalized.insert(key.clone(), count);
+        }
+    }
+    
+    normalized
+}
+
 /// Format duration into human-readable string
 fn format_duration(duration: Duration) -> String {
     let total_secs = duration.as_secs();
@@ -158,12 +221,12 @@ fn format_duration(duration: Duration) -> String {
 
 fn print_statistics(text_counts: &HashMap<String, usize>, hunt_duration: Duration) {
     println!("\n╔════════════════════════════════════════════════════════╗");
-    println!("║                        STATISTICS                      ║");
+    println!("║                    FINAL STATISTICS                    ║");
     println!("╚════════════════════════════════════════════════════════╝\n");
     
     if text_counts.is_empty() {
         println!("No encounters recorded.");
-        println!("Hunt duration: {}", format_duration(hunt_duration));
+        println!("Hunt Duration: {}", format_duration(hunt_duration));
         return;
     }
 
@@ -191,6 +254,7 @@ fn show_help() {
     println!("  [P] - Pause/Resume monitoring");
     println!("  [R] - Restart (clear all statistics)");
     println!("  [S] - Show current statistics");
+    println!("  [N] - Normalize Pokemon names (merge superstrings)");
     println!("  [?] - Show this help menu");
     println!("  [Q] - Quit and show final statistics\n");
 }
@@ -219,6 +283,7 @@ fn monitor_text(engine: &OcrEngine, screen: &Screen, config: &Config) -> Result<
     let mut pending_pokemon: Option<String> = None;
     let mut no_pattern_count = 0;
     let mut paused = false;
+    let mut window_paused = false;
     
     // Time tracking
     let start_time = Instant::now();
@@ -228,11 +293,37 @@ fn monitor_text(engine: &OcrEngine, screen: &Screen, config: &Config) -> Result<
     println!("\n╔══════════════════════════════════════════════════════╗");
     println!("║                  MONITORING STARTED                  ║");
     println!("╚══════════════════════════════════════════════════════╝");
+    if config.window_detection {
+        println!("Window detection enabled: {} ", TARGET_WINDOW_CLASS);
+    }
     show_help();
     println!("Tracking encounters with 'VS. Wild [Pokemon]' pattern");
     println!("Counts registered AFTER battle ends\n");
 
     loop {
+        // Window detection check
+        if config.window_detection {
+            match check_active_window() {
+                Ok(is_target) => {
+                    if !is_target && !window_paused {
+                        window_paused = true;
+                        pause_start = Some(Instant::now());
+                        println!("\n⏸  Auto-paused (window not focused)");
+                    } else if is_target && window_paused {
+                        if let Some(pause_time) = pause_start {
+                            total_paused_duration += pause_time.elapsed();
+                        }
+                        pause_start = None;
+                        window_paused = false;
+                        println!("\n▶  Auto-resumed (window focused)");
+                    }
+                }
+                Err(_) => {
+                    // Silently continue if hyprctl fails
+                }
+            }
+        
+
         // Check for keyboard input (non-blocking)
         if event::poll(Duration::from_millis(0))? {
             if let Event::Key(KeyEvent { code, .. }) = event::read()? {
@@ -263,6 +354,11 @@ fn monitor_text(engine: &OcrEngine, screen: &Screen, config: &Config) -> Result<
                         print_statistics(&text_counts, active_duration);
                         println!();
                     }
+                    KeyCode::Char('n') | KeyCode::Char('N') => {
+                        println!("\n=> Normalizing Pokemon names...");
+                        text_counts = normalize_pokemon_names(&text_counts);
+                        println!("✓ Normalization complete\n");
+                    }
                     KeyCode::Char('?') => {
                         show_help();
                     }
@@ -277,7 +373,7 @@ fn monitor_text(engine: &OcrEngine, screen: &Screen, config: &Config) -> Result<
             }
         }
 
-        if paused {
+        if paused || window_paused {
             thread::sleep(Duration::from_millis(100));
             continue;
         }
@@ -316,13 +412,13 @@ fn monitor_text(engine: &OcrEngine, screen: &Screen, config: &Config) -> Result<
                         }
                         
                         if !last_text.is_empty() {
-                            // println!("[Battle ended - ready for next encounter]");
+                            println!("[Battle ended - ready for next encounter]");
                             last_text.clear();
                         }
                         
                         no_pattern_count = 0;
                     } else if text != last_text && text.len() >= 10 {
-                        // println!("✗ Ignored (no 'VS. Wild' pattern): \"{}\"", text);
+                        println!("✗ Ignored (no 'VS. Wild' pattern): \"{}\"", text);
                         last_text = text;
                     }
                 }
