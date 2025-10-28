@@ -7,7 +7,7 @@ use screenshots::Screen;
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Structure to hold the selected region coordinates
 #[derive(Debug, Clone, Copy)]
@@ -19,10 +19,10 @@ struct Region {
 }
 
 /// Configuration presets
-const PRESET_X: i32 = 2280;
-const PRESET_Y: i32 = 65;
-const PRESET_WIDTH: u32 = 450;
-const PRESET_HEIGHT: u32 = 45;
+const PRESET_X: i32 = 2575;
+const PRESET_Y: i32 = 70;
+const PRESET_WIDTH: u32 = 870;
+const PRESET_HEIGHT: u32 = 55;
 const PRESET_REFRESH_MS: u64 = 500;
 const PRESET_EMPTY_THRESHOLD: u32 = 2;
 
@@ -140,13 +140,30 @@ fn extract_text(engine: &OcrEngine, image: &DynamicImage) -> Result<String> {
     Ok(text.trim().to_string())
 }
 
-fn print_statistics(text_counts: &HashMap<String, usize>) {
+/// Format duration into human-readable string
+fn format_duration(duration: Duration) -> String {
+    let total_secs = duration.as_secs();
+    let hours = total_secs / 3600;
+    let minutes = (total_secs % 3600) / 60;
+    let seconds = total_secs % 60;
+    
+    if hours > 0 {
+        format!("{}h {}m {}s", hours, minutes, seconds)
+    } else if minutes > 0 {
+        format!("{}m {}s", minutes, seconds)
+    } else {
+        format!("{}s", seconds)
+    }
+}
+
+fn print_statistics(text_counts: &HashMap<String, usize>, hunt_duration: Duration) {
     println!("\n╔════════════════════════════════════════════════════════╗");
-    println!("║                    FINAL STATISTICS                    ║");
+    println!("║                        STATISTICS                      ║");
     println!("╚════════════════════════════════════════════════════════╝\n");
     
     if text_counts.is_empty() {
         println!("No encounters recorded.");
+        println!("Hunt duration: {}", format_duration(hunt_duration));
         return;
     }
 
@@ -163,24 +180,56 @@ fn print_statistics(text_counts: &HashMap<String, usize>) {
     }
     
     println!("{}", "-".repeat(70));
-    println!("{:<50} | {:>5} | {:>5.1}%", "TOTAL", total, 100.0);
+    println!("{:<50} | {:>5}", "TOTAL", total);
+    println!("{:<50} | {}", "Hunt Duration", format_duration(hunt_duration));
+}
+
+fn show_help() {
+    println!("\n╔════════════════════════════════════════════════════════╗");
+    println!("║                   KEYBOARD CONTROLS                    ║");
+    println!("╚════════════════════════════════════════════════════════╝");
+    println!("  [P] - Pause/Resume monitoring");
+    println!("  [R] - Restart (clear all statistics)");
+    println!("  [S] - Show current statistics");
+    println!("  [?] - Show this help menu");
+    println!("  [Q] - Quit and show final statistics\n");
+}
+
+/// Extract pokemon name from text containing "VS. Wild [Pokemon Name]"
+fn extract_pokemon_name(text: &str) -> Option<String> {
+    let text_upper = text.to_uppercase();
+    
+    if let Some(vs_pos) = text_upper.find("VS. WILD") {
+        let after_wild = vs_pos + "VS. WILD".len();
+        let remaining = text[after_wild..].trim_start();
+        
+        if let Some(pokemon) = remaining.split_whitespace().next() {
+            if !pokemon.is_empty() {
+                return Some(pokemon.to_string());
+            }
+        }
+    }
+    
+    None
 }
 
 fn monitor_text(engine: &OcrEngine, screen: &Screen, config: &Config) -> Result<()> {
     let mut text_counts: HashMap<String, usize> = HashMap::new();
     let mut last_text = String::new();
-    let mut pending_pokemon: Option<String> = None; // Store pokemon until battle ends
-    let mut empty_count = 0;
+    let mut pending_pokemon: Option<String> = None;
+    let mut no_pattern_count = 0;
     let mut paused = false;
+    
+    // Time tracking
+    let start_time = Instant::now();
+    let mut total_paused_duration = Duration::ZERO;
+    let mut pause_start: Option<Instant> = None;
 
     println!("\n╔══════════════════════════════════════════════════════╗");
     println!("║                  MONITORING STARTED                  ║");
     println!("╚══════════════════════════════════════════════════════╝");
-    println!("\nControls:");
-    println!("  [P] - Pause/Resume monitoring");
-    println!("  [R] - Restart (clear all statistics)");
-    println!("  [Q] - Quit and show final statistics");
-    println!("\nOnly tracking encounters starting with 'Wild'");
+    show_help();
+    println!("Tracking encounters with 'VS. Wild [Pokemon]' pattern");
     println!("Counts registered AFTER battle ends\n");
 
     loop {
@@ -191,8 +240,13 @@ fn monitor_text(engine: &OcrEngine, screen: &Screen, config: &Config) -> Result<
                     KeyCode::Char('p') | KeyCode::Char('P') => {
                         paused = !paused;
                         if paused {
+                            pause_start = Some(Instant::now());
                             println!("\n⏸  PAUSED - Press 'P' to resume");
                         } else {
+                            if let Some(pause_time) = pause_start {
+                                total_paused_duration += pause_time.elapsed();
+                            }
+                            pause_start = None;
                             println!("\n▶  RESUMED");
                         }
                     }
@@ -200,12 +254,22 @@ fn monitor_text(engine: &OcrEngine, screen: &Screen, config: &Config) -> Result<
                         text_counts.clear();
                         last_text.clear();
                         pending_pokemon = None;
-                        empty_count = 0;
+                        no_pattern_count = 0;
                         println!("\n=> RESTARTED - All statistics cleared");
                     }
+                    KeyCode::Char('s') | KeyCode::Char('S') => {
+                        let active_duration = start_time.elapsed() - total_paused_duration;
+                        println!("\n");
+                        print_statistics(&text_counts, active_duration);
+                        println!();
+                    }
+                    KeyCode::Char('?') => {
+                        show_help();
+                    }
                     KeyCode::Char('q') | KeyCode::Char('Q') => {
+                        let active_duration = start_time.elapsed() - total_paused_duration;
                         println!("\n\n=> Monitoring stopped by user.");
-                        print_statistics(&text_counts);
+                        print_statistics(&text_counts, active_duration);
                         return Ok(());
                     }
                     _ => {}
@@ -229,11 +293,22 @@ fn monitor_text(engine: &OcrEngine, screen: &Screen, config: &Config) -> Result<
 
         match extract_text(engine, &image) {
             Ok(text) => {
-                if text.is_empty() {
-                    empty_count += 1;
+                if let Some(pokemon_name) = extract_pokemon_name(&text) {
+                    no_pattern_count = 0;
                     
-                    // Battle ended - count the pending pokemon
-                    if empty_count >= config.empty_threshold {
+                    let should_update = pending_pokemon.as_ref()
+                        .map(|p| p != &pokemon_name)
+                        .unwrap_or(true);
+                    
+                    if should_update {
+                        pending_pokemon = Some(pokemon_name.clone());
+                        println!("⏳ Detected: \"{}\" from \"{}\"", pokemon_name, text);
+                    }
+                    last_text = text;
+                } else {
+                    no_pattern_count += 1;
+                    
+                    if no_pattern_count >= config.empty_threshold {
                         if let Some(pokemon) = pending_pokemon.take() {
                             *text_counts.entry(pokemon.clone()).or_insert(0) += 1;
                             let count = text_counts[&pokemon];
@@ -241,22 +316,13 @@ fn monitor_text(engine: &OcrEngine, screen: &Screen, config: &Config) -> Result<
                         }
                         
                         if !last_text.is_empty() {
-                            println!("[Battle ended - ready for next encounter]");
+                            // println!("[Battle ended - ready for next encounter]");
                             last_text.clear();
                         }
-                    }
-                } else {
-                    empty_count = 0;
-                    
-                    if text.starts_with("Wild") {
-                        if text != last_text {
-                            // Store as pending, don't count yet
-                            pending_pokemon = Some(text.clone());
-                            println!("⏳ Detected: \"{}\" (pending confirmation...)", text);
-                            last_text = text;
-                        }
-                    } else if text != last_text {
-                        println!("✗ Ignored (doesn't start with 'Wild'): \"{}\"", text);
+                        
+                        no_pattern_count = 0;
+                    } else if text != last_text && text.len() >= 10 {
+                        // println!("✗ Ignored (no 'VS. Wild' pattern): \"{}\"", text);
                         last_text = text;
                     }
                 }
