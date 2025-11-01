@@ -1,7 +1,8 @@
 [package]
-name = "pro-hunter"
+name = "protean"
 version = "0.1.0"
 edition = "2024"
+description = "OCR and Tracking for wild encounters in Pokemon Revolution Online"
 
 [dependencies]
 screenshots = "0.8"
@@ -12,6 +13,8 @@ anyhow = "1.0"
 crossterm = "0.28"
 serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+dirs = "5.0"
 
 [profile.release]
 opt-level = 3
